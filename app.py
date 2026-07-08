@@ -2,7 +2,7 @@ import streamlit as st
 import time
 import json
 import os
-import hashlib
+import bcrypt
 import ai_engine as ai
 
 # Set page config
@@ -21,23 +21,19 @@ try:
 except Exception:
     lessons_data = []
 
-# Helper function for dynamic password hashing
-def hash_password(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode()).hexdigest()
+# Load user database from environment configuration
+user_db_env = os.getenv("USER_DB_HASHES")
+try:
+    USER_DB = json.loads(user_db_env) if user_db_env else {}
+except Exception:
+    USER_DB = {}
 
-# User Account Database (Stored securely using SHA-256 Hashes)
-USER_DB = {
-    "Ryan Farber": "7e9539d1ff6e5e9ea14b101157a2bae67e4da7b2049f7aecc47a7ff7db4f0caf",
-    "Harry Torres": "aeb2f12af743187f42d47c09eb0a832f066081373119e0fc366f1054cb9eef97",
-    "Guest1": "01148711a694a7c9b6ed60e9bf2da2a8699db5895f73bcfc58ada7dd3ad1f3ab",
-    "Guest2": "efeddc3a2c36da6355a5b655845bba8cfe82932091e08116236796ac7168d16d",
-    "Guest3": "8e4574329a83a862910a51a12e4e14193a45c76488e44749ac08ff50fb03891a",
-    "Guest4": "4b902f78357164244725b3e8b0db946d8fc1d452edc8394c8700fb12c40bb1e4",
-    "Guest5": "5dd3d8454fc33a8d77696b45cae3f1980648e7f1c1aa139ec2343dcb9244ccd5",
-    "Guest6": "e1bf4f7fcec5d14ea837fdbcb764d86b936fe5bb074ecbd79de654e58dc120c7",
-    "Guest7": "4904e6ad8f36d4c82744d10813c66ba40c6128775f9162e8ee7bd343803a3a8d",
-    "Guest8": "3a74d67db9d3643aa67912ea26f8c02dfb2d1168ae348e8c765fe3e74f26c915"
-}
+# Verification function using bcrypt
+def verify_password(plain_pwd: str, hashed_pwd: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_pwd.encode(), hashed_pwd.encode())
+    except Exception:
+        return False
 
 # --- Canva Glowing Purple/Blue Styling Overlay ---
 def inject_spotify_css():
@@ -326,8 +322,9 @@ if "quiz_states" not in st.session_state:
     st.session_state["quiz_states"] = {}
 
 # Theme mode state
-if "theme" not in st.session_state:
-    st.session_state["theme"] = "Dark Mode 🌙"
+if "app_theme_selector" not in st.session_state:
+    st.session_state["app_theme_selector"] = "Dark Mode 🌙"
+st.session_state["theme"] = st.session_state["app_theme_selector"]
 
 # Visited tabs trackers
 if "visited_tabs" not in st.session_state:
@@ -528,16 +525,13 @@ if not st.session_state["logged_in"]:
         </div>
         """, unsafe_allow_html=True)
     with col_theme:
-        st.session_state["theme"] = st.selectbox(
+        # Shared key theme selector
+        st.selectbox(
             "Theme Mode", 
             ["Dark Mode 🌙", "Light Mode ☀️"], 
-            key="login_theme_selector",
-            index=["Dark Mode 🌙", "Light Mode ☀️"].index(st.session_state.get("theme", "Dark Mode 🌙"))
+            key="app_theme_selector"
         )
-        # Rerun to switch backdrop colors immediately if changed
-        if st.session_state.get("theme") != st.session_state.get("prev_theme", ""):
-            st.session_state["prev_theme"] = st.session_state["theme"]
-            st.rerun()
+        st.session_state["theme"] = st.session_state["app_theme_selector"]
     
     # Welcome & Login Headings in the Center
     st.markdown("""
@@ -556,7 +550,7 @@ if not st.session_state["logged_in"]:
             submitted = st.form_submit_button("Log In")
             
             if submitted:
-                if username in USER_DB and USER_DB[username] == hash_password(password):
+                if username in USER_DB and verify_password(password, USER_DB[username]):
                     st.session_state["logged_in"] = True
                     st.session_state["username"] = username
                     st.success("Successfully logged in!")
@@ -568,11 +562,12 @@ if not st.session_state["logged_in"]:
 # --- SIDEBAR & NAVIGATION ---
 with st.sidebar:
     # Theme Mode Selector
-    st.session_state["theme"] = st.selectbox(
+    st.selectbox(
         "Theme Mode", 
         ["Dark Mode 🌙", "Light Mode ☀️"], 
-        index=["Dark Mode 🌙", "Light Mode ☀️"].index(st.session_state.get("theme", "Dark Mode 🌙"))
+        key="app_theme_selector"
     )
+    st.session_state["theme"] = st.session_state["app_theme_selector"]
     
     st.markdown(f"### Welcome, {st.session_state['username']}")
     st.write(f"Lang: `{st.session_state['language']}`")
@@ -600,12 +595,16 @@ with st.sidebar:
     
     for opt in nav_options:
         disabled = False
-        if st.session_state["quiz_active"] and opt == "🤖 AI Tutor":
-            disabled = True
-            btn_label = f"🤖 AI Tutor (🔒 Locked)"
-        else:
-            btn_label = opt
-            
+        btn_label = opt
+        
+        if st.session_state["quiz_active"]:
+            # If the quiz is active and NOT paused, lock all other screens to prevent background timer drain/cheating
+            if not st.session_state.get("quiz_paused", False):
+                if opt != "📚 Lessons":
+                    disabled = True
+                    btn_label = f"{opt} (🔒 Locked)"
+            # If the quiz is explicitly paused, we unlock all screens (including AI Tutor for remedial study)
+        
         if st.sidebar.button(btn_label, disabled=disabled, use_container_width=True):
             st.session_state["selected_page"] = opt
             st.rerun()
