@@ -3,6 +3,7 @@ import time
 import json
 import os
 import bcrypt
+import random
 import ai_engine as ai
 
 # Set page config
@@ -21,12 +22,15 @@ try:
 except Exception:
     lessons_data = []
 
-# Load user database from environment configuration
-user_db_env = os.getenv("USER_DB_HASHES")
-try:
-    USER_DB = json.loads(user_db_env) if user_db_env else {}
-except Exception:
-    USER_DB = {}
+# Load user database from environment configuration (cached in session state)
+if "USER_DB" not in st.session_state:
+    user_db_env = os.getenv("USER_DB_HASHES")
+    try:
+        st.session_state["USER_DB"] = json.loads(user_db_env) if user_db_env else {}
+    except Exception:
+        st.session_state["USER_DB"] = {}
+
+USER_DB = st.session_state["USER_DB"]
 
 # Verification function using bcrypt
 def verify_password(plain_pwd: str, hashed_pwd: str) -> bool:
@@ -34,6 +38,82 @@ def verify_password(plain_pwd: str, hashed_pwd: str) -> bool:
         return bcrypt.checkpw(plain_pwd.encode(), hashed_pwd.encode())
     except Exception:
         return False
+
+# Strength check function for signup security enforcement
+def is_strong_password(pwd: str) -> tuple[bool, str]:
+    if len(pwd) < 8:
+        return False, "Password must be at least 8 characters long."
+    if not any(c.isupper() for c in pwd):
+        return False, "Password must contain at least one uppercase letter (A-Z)."
+    if not any(c.islower() for c in pwd):
+        return False, "Password must contain at least one lowercase letter (a-z)."
+    if not any(c.isdigit() for c in pwd):
+        return False, "Password must contain at least one number (0-9)."
+    special_chars = "!@#$%^&*()-_=+[]{}|;:',.<>?/`~"
+    if not any(c in special_chars for c in pwd):
+        return False, "Password must contain at least one special character (e.g., !@#$%^&*)."
+    return True, ""
+
+# Persistent database saving helper
+def save_user_to_db(username: str, password: str):
+    salt = bcrypt.gensalt(12)
+    hashed = bcrypt.hashpw(password.encode(), salt).decode()
+    st.session_state["USER_DB"][username] = hashed
+    global USER_DB
+    USER_DB = st.session_state["USER_DB"]
+    try:
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        hashes_json = json.dumps(USER_DB)
+        found = False
+        for idx, line in enumerate(lines):
+            if line.startswith("USER_DB_HASHES="):
+                lines[idx] = f"USER_DB_HASHES='{hashes_json}'\n"
+                found = True
+                break
+        if not found:
+            lines.append(f"\nUSER_DB_HASHES='{hashes_json}'\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+
+# Shuffler function to randomize the position of the correct answer
+def shuffle_quiz_options(questions: list) -> list:
+    for q in questions:
+        if "options" in q and "correct_answer" in q:
+            correct_idx = q["correct_answer"]
+            if 0 <= correct_idx < len(q["options"]):
+                correct_text = q["options"][correct_idx]
+                
+                # Strip prefixes like "A) " or "A. " if they exist
+                clean_options = []
+                clean_correct = ""
+                for idx, opt in enumerate(q["options"]):
+                    clean_opt = opt
+                    if opt.startswith(("A) ", "B) ", "C) ", "D) ")):
+                        clean_opt = opt[3:]
+                    elif opt.startswith(("A. ", "B. ", "C. ", "D. ")):
+                        clean_opt = opt[3:]
+                    
+                    clean_options.append(clean_opt)
+                    if idx == correct_idx:
+                        clean_correct = clean_opt
+                
+                # Shuffle clean options
+                random.shuffle(clean_options)
+                
+                # Find new correct index
+                new_correct_idx = clean_options.index(clean_correct) if clean_correct in clean_options else 0
+                
+                # Re-apply standard A), B), C), D) prefixes
+                prefixes = ["A) ", "B) ", "C) ", "D) "]
+                q["options"] = [prefixes[i] + clean_options[i] for i in range(len(clean_options))]
+                q["correct_answer"] = new_correct_idx
+    return questions
 
 # --- Canva Glowing Purple/Blue Styling Overlay ---
 def inject_spotify_css():
@@ -401,18 +481,24 @@ def submit_quiz(timeout=False):
     
     correct_count = 0
     evaluated_answers = []
+    user_answers_indices = {}
     
     for i, q in enumerate(questions):
         u_ans = user_answers.get(i)
         c_ans = q["correct_answer"]
-        is_correct = (u_ans == c_ans)
+        
+        # Convert selected option string to its list index for integer comparison
+        u_ans_idx = q["options"].index(u_ans) if u_ans in q["options"] else None
+        user_answers_indices[i] = u_ans_idx
+        
+        is_correct = (u_ans_idx == c_ans)
         if is_correct:
             correct_count += 1
             
         evaluated_answers.append({
             "question": q["question"],
             "code": q.get("code", ""),
-            "user_answer": q["options"][u_ans] if u_ans is not None else "No Answer",
+            "user_answer": u_ans if u_ans is not None else "No Answer",
             "correct_answer": q["options"][c_ans],
             "is_correct": is_correct,
             "explanation": q["explanation"]
@@ -429,7 +515,7 @@ def submit_quiz(timeout=False):
             language=st.session_state["language"],
             score=score,
             quiz_data=questions,
-            user_answers=user_answers
+            user_answers=user_answers_indices
         )
         
     # Save results
@@ -541,22 +627,46 @@ if not st.session_state["logged_in"]:
     </div>
     """, unsafe_allow_html=True)
     
-    # Login Form
+    # Login & Signup Forms with Tabs
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        with st.form("login_form"):
-            username = st.text_input("Username", placeholder="Username")
-            password = st.text_input("Password", type="password", placeholder="Password")
-            submitted = st.form_submit_button("Log In")
-            
-            if submitted:
-                if username in USER_DB and verify_password(password, USER_DB[username]):
-                    st.session_state["logged_in"] = True
-                    st.session_state["username"] = username
-                    st.success("Successfully logged in!")
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password. Please try again.")
+        tab_login, tab_signup = st.tabs(["🔐 Log In", "📝 Create Account"])
+        
+        with tab_login:
+            with st.form("login_form"):
+                username = st.text_input("Username", key="login_user", placeholder="Username")
+                password = st.text_input("Password", type="password", key="login_pass", placeholder="Password")
+                submitted = st.form_submit_button("Log In")
+                
+                if submitted:
+                    if username in USER_DB and verify_password(password, USER_DB[username]):
+                        st.session_state["logged_in"] = True
+                        st.session_state["username"] = username
+                        st.success("Successfully logged in!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password. Please try again.")
+                        
+        with tab_signup:
+            with st.form("signup_form"):
+                new_username = st.text_input("Choose Username", key="signup_user", placeholder="New Username")
+                new_password = st.text_input("Choose Password", type="password", key="signup_pass", placeholder="New Password")
+                new_password_confirm = st.text_input("Confirm Password", type="password", key="signup_pass_confirm", placeholder="Confirm Password")
+                signup_submitted = st.form_submit_button("Create Account")
+                
+                if signup_submitted:
+                    is_strong, err_msg = is_strong_password(new_password)
+                    if not new_username.strip() or not new_password.strip():
+                        st.error("Username and password cannot be empty.")
+                    elif new_password != new_password_confirm:
+                        st.error("Passwords do not match.")
+                    elif not is_strong:
+                        st.error(f"❌ Weak Password: {err_msg}")
+                    elif new_username in USER_DB:
+                        st.error("Username already exists.")
+                    else:
+                        save_user_to_db(new_username, new_password)
+                        st.success("Account created successfully! You can now toggle to Log In.")
     st.stop()
 
 # --- SIDEBAR & NAVIGATION ---
@@ -571,6 +681,34 @@ with st.sidebar:
     
     st.markdown(f"### Welcome, {st.session_state['username']}")
     st.write(f"Lang: `{st.session_state['language']}`")
+    
+    # Calculate reading and passing progress points
+    read_points = 0
+    for l in lessons_data:
+        total_tabs = len(l["tabs"].keys())
+        if "video_url" in l:
+            total_tabs += 1
+        visited = len(st.session_state["visited_tabs"].get(l["id"], set()))
+        if visited >= total_tabs:
+            read_points += 1
+            
+    passed_points = len(st.session_state["completed_lessons"])
+    total_points = read_points + passed_points
+    progress_percent = int((total_points / 10) * 100) if lessons_data else 0
+    
+    # Render customized progress card
+    st.markdown(f"""
+    <div style='background-color: rgba(255, 255, 255, 0.03); padding: 12px; border-radius: 8px; border: 1px solid rgba(142, 45, 226, 0.25); margin-top: 10px; margin-bottom: 15px;'>
+        <div style='font-size: 13px; font-weight: bold; color: inherit; margin-bottom: 5px;'>🏆 Course Progress: {progress_percent}%</div>
+        <div style='background-color: rgba(255, 255, 255, 0.1); border-radius: 5px; height: 10px; width: 100%; overflow: hidden;'>
+            <div style='background: linear-gradient(90deg, #8E2DE2 0%, #4A00E0 100%); width: {progress_percent}%; height: 100%; border-radius: 5px;'></div>
+        </div>
+        <div style='font-size: 11px; color: inherit; margin-top: 6px; display: flex; justify-content: space-between; opacity: 0.8;'>
+            <span>📖 Read: {read_points}/5</span>
+            <span>📝 Quizzes: {passed_points}/5</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Secret Bypass
     bypass_input = st.text_input("Unlock Bypass (Key)", type="password")
@@ -658,10 +796,57 @@ elif st.session_state["selected_page"] == "📚 Lessons":
         # RENDER QUIZ BLOCK HERE
         left_time = update_timer()
         if left_time is not None:
-            timer_class = "timer-container timer-paused" if st.session_state["quiz_paused"] else "timer-container"
-            mins = int(left_time // 60)
-            secs = int(left_time % 60)
-            st.markdown(f"<div class='{timer_class}'>⏱️ Time Remaining: {mins:02d}:{secs:02d}</div>", unsafe_allow_html=True)
+            if st.session_state["quiz_paused"]:
+                timer_class = "timer-container timer-paused"
+                mins = int(left_time // 60)
+                secs = int(left_time % 60)
+                st.markdown(f"<div class='{timer_class}'>⏱️ Time Remaining: {mins:02d}:{secs:02d} (Paused)</div>", unsafe_allow_html=True)
+            else:
+                # Real-time Javascript countdown clock
+                import streamlit.components.v1 as components
+                timer_html = f"""
+                <div id="js-timer" style="
+                    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+                    font-size: 20px;
+                    font-weight: bold;
+                    color: #FF5555;
+                    text-align: center;
+                    padding: 12px;
+                    background-color: #110e24;
+                    border-radius: 8px;
+                    border: 1px solid #FF5555;
+                    box-shadow: 0 0 15px rgba(255, 85, 85, 0.2);
+                    margin-bottom: 15px;
+                ">
+                    ⏱️ Time Remaining: <span id="timer-display">--:--</span>
+                </div>
+                <script>
+                    let timeRemaining = {int(left_time)};
+                    const display = document.getElementById("timer-display");
+                    
+                    function updateDisplay() {{
+                        let mins = Math.floor(timeRemaining / 60);
+                        let secs = timeRemaining % 60;
+                        display.textContent = (mins < 10 ? "0" : "") + mins + ":" + (secs < 10 ? "0" : "") + secs;
+                    }}
+                    
+                    updateDisplay();
+                    
+                    const interval = setInterval(() => {{
+                        timeRemaining--;
+                        if (timeRemaining <= 0) {{
+                            clearInterval(interval);
+                            display.textContent = "00:00 - Time Expired!";
+                            try {{
+                                window.parent.location.reload();
+                            }} catch(e) {{}}
+                        }} else {{
+                            updateDisplay();
+                        }}
+                    }}, 1000);
+                </script>
+                """
+                components.html(timer_html, height=75)
             
             col_p, col_r = st.columns(2)
             with col_p:
@@ -753,7 +938,7 @@ elif st.session_state["selected_page"] == "📚 Lessons":
                         st.session_state["quiz_time_limit"] = 40 * 60  # 40 mins
                         st.session_state["quiz_start_time"] = time.time()
                         st.session_state["quiz_paused"] = False
-                        st.session_state["quiz_questions"] = quiz_data["questions"]
+                        st.session_state["quiz_questions"] = shuffle_quiz_options(quiz_data["questions"])
                         st.session_state["quiz_answers"] = {}
                         st.rerun()
         st.stop()
@@ -870,7 +1055,7 @@ elif st.session_state["selected_page"] == "📚 Lessons":
                     st.session_state["quiz_time_limit"] = 40 * 60  # 40 mins
                     st.session_state["quiz_start_time"] = time.time()
                     st.session_state["quiz_paused"] = False
-                    st.session_state["quiz_questions"] = quiz_data["questions"]
+                    st.session_state["quiz_questions"] = shuffle_quiz_options(quiz_data["questions"])
                     st.session_state["quiz_answers"] = {}
                     st.rerun()
                 else:
